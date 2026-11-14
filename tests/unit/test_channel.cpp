@@ -3,6 +3,7 @@
 #include <gtest/gtest.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstring>
 #include <random>
 #include <stdexcept>
@@ -574,16 +575,27 @@ TEST(ChannelTest, RestartWhileTheOtherSideIsSending) {
     }
   });
   // A's receiving side restarts A's session while A's sender keeps going.
-  for (int i = 0; i < 50; ++i) {
+  // Each new session must carry messages again: wait (bounded) until the
+  // sender gets one through, whatever the scheduler does.
+  constexpr int kSessions = 50;
+  int sessions_with_traffic = 0;
+  for (int i = 0; i < kSessions; ++i) {
     p.a->restart();
     while (!p.establish(1)) {
       drain_all(*p.b);
     }
+    const std::uint64_t before = accepted.load();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (accepted.load() == before && std::chrono::steady_clock::now() < deadline) {
+      drain_all(*p.b);
+      std::this_thread::yield();
+    }
+    sessions_with_traffic += accepted.load() > before ? 1 : 0;
     drain_all(*p.b);
   }
   stop = true;
   tx.join();
-  EXPECT_GT(accepted.load(), 0U);
+  EXPECT_EQ(sessions_with_traffic, kSessions);
   EXPECT_EQ(p.b->stats().rx_crc_errors, 0U);
   EXPECT_EQ(p.b->stats().rx_protocol_errors, 0U);
 }
