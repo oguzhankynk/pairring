@@ -68,8 +68,9 @@ inline constexpr std::uint64_t kMagic = 0x474E495252494150ULL;  // "PAIRRING" in
 inline constexpr std::uint32_t kVersion = 1;
 
 // Written by an endpoint into its peer's region at layout::kHello. The commit
-// word at layout::kHelloCommit is stored last; `crc` lets a reader reject a
-// block it read while the peer was rewriting it.
+// word at layout::kHelloCommit is stored last. `peer_seen` is the peer epoch
+// the writer had accepted when it wrote the block: it tells the peer whether
+// the writer already holds its announcement. `crc` covers every other byte.
 struct Hello {
   std::uint64_t magic;
   std::uint32_t version;
@@ -77,16 +78,18 @@ struct Hello {
   std::uint32_t granule_size;
   std::uint32_t granule_count;
   std::uint32_t max_message;
-  std::uint32_t reserved;
+  std::uint32_t crc;
   std::uint64_t ring_offset;
   std::uint64_t epoch;
-  std::uint32_t crc;
-  std::uint32_t pad;
+  std::uint64_t peer_seen;
 };
 static_assert(sizeof(Hello) == layout::kHelloCommit, "hello block layout");
 
 inline std::uint32_t hello_crc(const Hello& h) noexcept {
-  return crc32c(&h, offsetof(Hello, crc));
+  Crc32c c;
+  c.update(&h, offsetof(Hello, crc));
+  c.update(&h.ring_offset, sizeof(Hello) - offsetof(Hello, ring_offset));
+  return c.value();
 }
 
 inline std::uint64_t load_acquire(const unsigned char* p) noexcept {
@@ -166,7 +169,7 @@ public:
       throw std::invalid_argument("local region is smaller than region_size(config)");
     }
     my_epoch_ = detail::new_epoch(this);
-    if (!publish_hello()) {
+    if (!announce()) {
       state_.store(State::kBroken, std::memory_order_release);
     }
   }
@@ -327,7 +330,7 @@ public:
     rejected_peer_ = 0;
     consumed_ = 0;
     tail_ = 0;
-    if (!publish_hello()) {
+    if (!announce()) {
       state_.store(State::kBroken, std::memory_order_seq_cst);
     }
   }
@@ -411,6 +414,8 @@ private:
     quiesce(State::kBroken);
   }
 
+  // Writes our announcement into the peer's region and zeroes our counters
+  // there; `peer_seen` tells the peer whether we already hold its announcement.
   bool publish_hello() noexcept {
     detail::Hello h{};
     h.magic = detail::kMagic;
@@ -420,39 +425,73 @@ private:
     h.max_message = cfg_.max_message;
     h.ring_offset = layout::kRing;
     h.epoch = my_epoch_;
+    h.peer_seen = accepted_peer_;
     h.crc = detail::hello_crc(h);
-    return remote_.write(layout::kHello, &h, sizeof(h)) && remote_.store64(layout::kRxTail, 0) &&
-           remote_.store64(layout::kTxHead, 0) &&
+    return remote_.write(layout::kHello, &h, sizeof(h)) && zero_peer_counters() &&
            remote_.store64(layout::kHelloCommit, my_epoch_) && remote_.notify();
   }
 
-  // A committed hello with an epoch we have not seen: a new peer session.
+  // Our counters in the peer's region start over with a session.
+  bool zero_peer_counters() noexcept {
+    return remote_.store64(layout::kRxTail, 0) && remote_.store64(layout::kTxHead, 0);
+  }
+
+  // At construction and restart: take the peer's announcement if it is
+  // already in our region, then announce ourselves (saying that we hold it,
+  // so the peer need not write its announcement again).
+  bool announce() noexcept {
+    detail::Hello h{};
+    const std::uint64_t commit = detail::load_acquire(local_ + layout::kHelloCommit);
+    const bool adopted = commit != 0 && read_hello(commit, h) && compatible(h);
+    if (adopted) {
+      peer_cfg_ = Config{h.granule_size, h.granule_count, h.max_message};
+      accepted_peer_ = commit;
+    }
+    return publish_hello() &&
+           (!adopted || (remote_.store64(layout::kAck, commit) && remote_.notify()));
+  }
+
+  // The hello block in our region, if it is complete and belongs to `commit`.
+  bool read_hello(std::uint64_t commit, detail::Hello& h) const noexcept {
+    std::memcpy(&h, local_ + layout::kHello, sizeof(h));
+    return h.epoch == commit && h.crc == detail::hello_crc(h);
+  }
+
+  bool compatible(const detail::Hello& h) const noexcept {
+    const Config peer{h.granule_size, h.granule_count, h.max_message};
+    return h.magic == detail::kMagic && h.version == detail::kVersion &&
+           h.ring_offset == layout::kRing && validate(peer) == nullptr &&
+           region_size(peer) <= remote_.size();
+  }
+
+  // A committed hello with an epoch we have not accepted: a new peer session.
   void accept_peer(std::uint64_t commit) noexcept {
     detail::Hello h{};
-    std::memcpy(&h, local_ + layout::kHello, sizeof(h));
-    if (h.epoch != commit || h.crc != detail::hello_crc(h)) {
-      return;  // read while the peer was rewriting it; try again on the next poll
+    if (!read_hello(commit, h)) {
+      return;  // read while the peer was writing it; try again on the next poll
     }
-    const Config peer{h.granule_size, h.granule_count, h.max_message};
-    if (h.magic != detail::kMagic || h.version != detail::kVersion ||
-        h.ring_offset != layout::kRing || validate(peer) != nullptr ||
-        region_size(peer) > remote_.size()) {
+    if (!compatible(h)) {
       rejected_peer_ = commit;
       quiesce(State::kIncompatible);
       return;
     }
     const bool restarted = accepted_peer_ != 0;
     quiesce(State::kHandshaking);
-    peer_cfg_ = peer;
+    peer_cfg_ = Config{h.granule_size, h.granule_count, h.max_message};
     consumed_ = 0;
     tail_ = 0;
     accepted_peer_ = commit;
     if (restarted) {
       detail::bump(counters_.resets);
     }
-    // Always announce again: the peer may have a fresh region that never saw
-    // our hello. This also zeroes our counters in the peer's region.
-    if (!publish_hello() || !remote_.store64(layout::kAck, commit) || !remote_.notify()) {
+    // Announce again only if the peer may lack our announcement: it restarted
+    // and its new session has not seen us. Its region is then new, so nothing
+    // there is being read. Otherwise rewriting the block could race with the
+    // peer reading it; only our counters start over.
+    const bool reannounce = restarted && h.peer_seen != my_epoch_;
+    const bool ok = (reannounce ? publish_hello() : zero_peer_counters()) &&
+                    remote_.store64(layout::kAck, commit) && remote_.notify();
+    if (!ok) {
       broken();
     }
   }

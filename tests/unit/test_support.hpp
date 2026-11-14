@@ -48,6 +48,7 @@ public:
 
   bool write(std::uint64_t off, const void* src, std::size_t len) noexcept override {
     ++writes;
+    hello_writes += off == layout::kHello ? 1U : 0U;
     return !fail() && inner_.write(off, src, len);
   }
   bool writev(std::uint64_t off, const Piece* pieces, std::size_t count) noexcept override {
@@ -78,6 +79,7 @@ public:
   }
 
   std::atomic<std::uint64_t> writes{0};
+  std::atomic<std::uint64_t> hello_writes{0};  // announcements written into the peer's region
   std::atomic<std::uint64_t> writevs{0};
   std::atomic<std::uint64_t> stores{0};
   std::atomic<std::uint64_t> doorbells{0};
@@ -111,6 +113,7 @@ public:
   explicit DelayedRegion(Memory& peer) : inner_(peer.data(), peer.bytes()) {}
 
   bool write(std::uint64_t off, const void* src, std::size_t len) noexcept override {
+    hello_writes += off == layout::kHello ? 1U : 0U;
     const auto* p = static_cast<const unsigned char*>(src);
     ops_.push_back({false, off, std::vector<unsigned char>(p, p + len), 0});
     return true;
@@ -143,6 +146,8 @@ public:
   std::size_t pending() const noexcept {
     return ops_.size();
   }
+
+  std::uint64_t hello_writes = 0;  // announcements written into the peer's region
 
 private:
   struct Op {

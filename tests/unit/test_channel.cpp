@@ -305,6 +305,57 @@ TEST(ChannelTest, RestartFromEitherSide) {
   EXPECT_EQ(p.b->stats().resets, 3U);
 }
 
+// The announcement is written once per side and session: rewriting it while
+// the peer reads it would be a race. It is written again only for a peer
+// whose new region cannot hold it.
+TEST(ChannelTest, NormalStartWritesEachAnnouncementOnce) {
+  Pair<> p;  // A starts first; B finds A's announcement when it starts
+  ASSERT_TRUE(p.establish());
+  EXPECT_EQ(p.to_b.hello_writes.load(), 1U);
+  EXPECT_EQ(p.to_a.hello_writes.load(), 1U);
+}
+
+TEST(ChannelTest, SimultaneousStartWritesEachAnnouncementOnce) {
+  // Writes arrive only when pumped: both sides announce before either sees
+  // the other, so both announcements say "peer not seen yet".
+  Pair<DelayedRegion> p;
+  bool up = false;
+  for (int i = 0; i < 100 && !up; ++i) {
+    p.to_a.pump(1000);
+    p.to_b.pump(1000);
+    const State sa = p.a->poll();  // both every round: each needs the other's ack
+    const State sb = p.b->poll();
+    up = sa == State::kEstablished && sb == State::kEstablished;
+  }
+  ASSERT_TRUE(up);
+  EXPECT_EQ(p.to_b.hello_writes, 1U);
+  EXPECT_EQ(p.to_a.hello_writes, 1U);
+  ASSERT_TRUE(p.a->send("x", 1));
+  p.to_b.pump(1000);
+  EXPECT_EQ(drain_all(*p.b).size(), 1U);
+}
+
+TEST(ChannelTest, RestartInPlaceDoesNotMakeThePeerAnnounceAgain) {
+  Pair<> p;
+  ASSERT_TRUE(p.establish());
+  p.b->restart();  // B keeps its region, which still holds A's announcement
+  ASSERT_TRUE(p.establish());
+  EXPECT_EQ(p.to_a.hello_writes.load(), 2U);  // B announced its new session
+  EXPECT_EQ(p.to_b.hello_writes.load(), 1U);  // A had no reason to write again
+  ASSERT_TRUE(p.a->send("x", 1));
+  EXPECT_EQ(drain_all(*p.b).size(), 1U);
+}
+
+TEST(ChannelTest, PeerWithANewRegionGetsTheAnnouncementAgain) {
+  Pair<> p;
+  ASSERT_TRUE(p.establish());
+  p.b.reset();
+  p.mem_b.clear();  // a new region: A's announcement is gone
+  p.b.emplace(p.mem_b.region(), p.to_a, p.cb);
+  ASSERT_TRUE(p.establish());
+  EXPECT_EQ(p.to_b.hello_writes.load(), 2U);  // A announced again
+}
+
 TEST(ChannelTest, IncompatiblePeerIsRejected) {
   Pair<> p;
   // A hello with a valid checksum but another version.

@@ -33,6 +33,9 @@ Further rules:
 - There are no remote reads.
 - An operation that fails (peer gone, link down) returns `false`; the channel
   then goes to `Broken` (section 6).
+- A region keeps what was written into it for as long as the channel that
+  owns it exists. Replacing a region (for example re-creating it) means a new
+  channel, and so a new epoch, on that side.
 
 How regions are created, published and connected is the lower layer's
 business. The channel receives them ready to use.
@@ -148,35 +151,47 @@ mixed with the address of the channel object).
 | 16 | `granule_size` | `u32` |
 | 20 | `granule_count` | `u32` |
 | 24 | `max_message` | `u32` |
-| 28 | `reserved` | `u32` |
+| 28 | `crc` | `u32`, CRC-32C of bytes 0..27 and 32..55 |
 | 32 | `ring_offset` | `u64` = 256 |
 | 40 | `epoch` | `u64`, the sender's epoch |
-| 48 | `crc` | `u32`, CRC-32C of bytes 0..47 |
-| 52 | `pad` | `u32` |
+| 48 | `peer_seen` | `u64`, the receiver's epoch the sender had accepted when it wrote the block, or 0 |
 | 56 | `hello_commit` | `u64`, equal to `epoch`, written last |
 
 The geometry fields describe the sender's **rx** ring: the ring the receiver of
 this block will write into.
 
 A reader takes the block only when `epoch == hello_commit` and the `crc`
-matches. A block read while the peer was rewriting it fails that check and is
-read again on the next poll, so rewriting needs no extra ordering.
+matches; otherwise it reads it again on the next poll.
+
+An endpoint writes its block once per session, and again only when the peer
+cannot have it (see Accepting, step 3). A block is therefore not rewritten
+while the peer may be reading it.
 
 **Publishing hello** (endpoint X, peer Y), in this order:
 
-1. `write` the 56-byte block into Y's region.
+1. `write` the 56-byte block into Y's region, `peer_seen` = the epoch of Y that
+   X has accepted, or 0.
 2. `store64(Y.rx_tail, 0)` and `store64(Y.tx_head, 0)`: X's counters start over.
 3. `store64(Y.hello_commit, epoch_X)`: commits steps 1 and 2.
 4. `notify()`.
+
+**Announcing** (at construction and at `restart()`):
+
+1. If X's own region already holds a valid, compatible hello of Y, X accepts
+   it right away: it takes Y's geometry and remembers `epoch_Y`.
+2. X publishes hello; its `peer_seen` tells Y whether X already holds Y's block.
+3. If X accepted Y in step 1: `store64(Y.ack, epoch_Y)`, `notify()`.
 
 **Accepting** the peer (X sees a committed hello with an epoch it has not accepted yet):
 
 1. Check `magic`, `version` and that the peer's ring fits the remote region.
    On failure: `Incompatible`.
 2. Reset local state for the new session: `consumed = 0`, tx `tail = 0`.
-3. Publish hello again. Y may have a fresh region that never saw X's earlier
-   announcement (for example after Y re-created it), and this also zeroes X's
-   counters in Y's region for the new session.
+3. If X had accepted an earlier epoch of Y (Y restarted) and Y's hello does not
+   name X's current epoch in `peer_seen`, Y's new session found no hello of X:
+   its region is new. Publish hello again; nothing in that region is being
+   read. Otherwise only zero X's counters in Y's region
+   (`store64(Y.rx_tail, 0)`, `store64(Y.tx_head, 0)`).
 4. `store64(Y.ack, epoch_Y)`, `notify()`.
 
 X is **Established** when it has accepted `epoch_Y` and its local `ack` equals
@@ -189,6 +204,9 @@ Why this is safe:
 - Y sends only after X acknowledges `epoch_Y`, and X acknowledges only after it
   has reset its counters.
 - A restarted endpoint announces a new epoch; the peer resets on seeing it.
+- Two endpoints that start at the same time both announce `peer_seen = 0`;
+  each region still receives the other's block, so each side accepts the
+  other and acknowledges without writing its block again.
 
 **Delivery**: within a session every message is delivered once, in order, with
 none lost. Messages in flight when a session ends are dropped. There is no
